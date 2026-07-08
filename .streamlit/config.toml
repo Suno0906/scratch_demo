@@ -1,0 +1,31 @@
+# 미니멀 분석 대시보드 테마 (Linear/Vercel 느낌 — 중립 배경 + 단일 강조색)
+# 색은 이 파일에서만 관리합니다. 앱 코드엔 CSS를 넣지 않습니다.
+
+[theme]
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+baseRadius = "10px"
+linkUnderline = false
+headingFontWeights = [600, 600, 600, 600, 500, 500]
+chartCategoricalColors = ["#10B981", "#F59E0B", "#EF4444", "#6366F1", "#8B5CF6", "#0EA5E9", "#64748B"]
+
+[theme.light]
+primaryColor = "#6366F1"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f6f7f9"
+textColor = "#18181b"
+borderColor = "#e4e4e7"
+greenColor = "#10B981"
+orangeColor = "#F59E0B"
+redColor = "#EF4444"
+grayColor = "#71717A"
+
+[theme.dark]
+primaryColor = "#818cf8"
+backgroundColor = "#0b0c0f"
+secondaryBackgroundColor = "#16181d"
+textColor = "#e7e7ea"
+borderColor = "#26272b"
+greenColor = "#34D399"
+orangeColor = "#FBBF24"
+redColor = "#F87171"
+grayColor = "#a1a1aa"
