@@ -16,7 +16,11 @@ from plotly.subplots import make_subplots
 from scipy import signal as sps
 from scipy.stats import spearmanr
 from sklearn.metrics import f1_score, cohen_kappa_score
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import SVC
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
 from sklearn.model_selection import cross_val_predict, GroupKFold
 
 np.random.seed(0)  # 재현성(현재 파이프라인엔 난수 없음, 원칙상 고정)
@@ -278,6 +282,95 @@ def flow_fig(times, posv, pred, true_lab, lo, hi, pos):
     return fig
 
 
+# ── 지도학습 모델 + 시간별(윈도우) 다목적 분류 ───────────────────
+MODELS = {
+    'RandomForest': lambda: RandomForestClassifier(n_estimators=150, class_weight='balanced', random_state=42),
+    '로지스틱회귀': lambda: make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, class_weight='balanced', random_state=42)),
+    'SVM': lambda: make_pipeline(StandardScaler(), SVC(class_weight='balanced', random_state=42)),
+    '그래디언트부스팅': lambda: GradientBoostingClassifier(random_state=42),
+}
+TARGET_LABEL = {
+    '강도': lambda d: KR[d['intensity']] if d.get('label') == 'SCRATCH' and d.get('intensity') in INT3 else None,
+    '부위': lambda d: d.get('body_region'),
+    '긁기 감지': lambda d: d.get('label', 'SCRATCH'),
+}
+REGION_COLOR = {'head_neck': '#6366F1', 'arm': '#10B981', 'torso': '#F59E0B', 'leg': '#EF4444'}
+
+
+def class_color(target, c):
+    if target == '강도':
+        return COLOR[ENG.get(c, 'weak')]
+    if target == '긁기 감지':
+        return {'SCRATCH': '#10B981', 'NOT_SCRATCH': '#94A3B8'}.get(c, '#94A3B8')
+    return REGION_COLOR.get(c, '#64748B')
+
+
+def class_disp(target, c):
+    return vk(c) if target == '부위' else c
+
+
+def optimal_boundaries(scores, ytrue, step=0.025):
+    """macro-F1을 최대화하는 (lo, hi) 경계 자동 탐색. 유일 제약 lo ≤ hi."""
+    gv = np.round(np.arange(0.05, 0.96, step), 3)
+    best = (-1.0, 0.40, 0.60)
+    for L in gv:
+        for H in gv:
+            if H < L:
+                continue
+            p = np.where(scores < L, 0, np.where(scores > H, 2, 1))
+            f1 = f1_score(ytrue, p, average='macro', labels=[0, 1, 2], zero_division=0)
+            if f1 > best[0]:
+                best = (f1, float(L), float(H))
+    return best[1], best[2], best[0]
+
+
+@st.cache_resource(show_spinner=False)
+def ml_windows(_data, idxs, target, model_name, fs, trim, sig):
+    """학습셋 샘플들을 윈도우화(det_features 12차원)해 지도학습 모델 학습.
+    동작 단위(sample) GroupKFold OOF 예측으로 각 윈도우를 정직하게(자기 샘플 미학습) 판정."""
+    labfn = TARGET_LABEL[target]
+    X, y, grp, starts = [], [], [], []
+    w = int(fs); h = max(1, int(0.25 * fs))
+    for i in idxs:
+        d = _data[i]; lab = labfn(d)
+        if lab is None:
+            continue
+        a = amag(d, trim); gy = gmag(d, trim); gy = np.zeros_like(a) if gy is None else gy
+        for s in range(0, len(a) - w + 1, h):
+            X.append(det_features(a[s:s + w], gy[s:s + w], fs)); y.append(lab); grp.append(i); starts.append(s)
+    X = np.array(X); y = np.array(y); grp = np.array(grp); starts = np.array(starts)
+    classes = sorted(set(y.tolist())) if len(y) else []
+    oof = cvacc = model = None
+    if len(classes) >= 2 and len(set(grp.tolist())) >= 2:
+        k = min(5, len(set(grp.tolist())))
+        try:
+            oof = cross_val_predict(MODELS[model_name](), X, y, cv=GroupKFold(k), groups=grp)
+            cvacc = float((oof == y).mean())
+        except Exception:
+            oof = None
+        model = MODELS[model_name](); model.fit(X, y)
+    return dict(y=y, grp=grp, starts=starts, oof=oof, cvacc=cvacc, classes=classes, model=model, w=w, fs=fs)
+
+
+def class_band_fig(times, pred, gt, target, classes, pos):
+    """예측 클래스 타임라인: 위=정답·아래=예측 색 띠 + 불일치 ✕. 어떤 대상(강도/부위/감지)에도 동작."""
+    cidx = {c: i for i, c in enumerate(classes)}; ncat = max(1, len(classes)); n = len(times)
+    zr = lambda vals: [(cidx[v] + 0.5) if (i < pos and v in cidx) else None for i, v in enumerate(vals)]
+    cs = []
+    for i, c in enumerate(classes):
+        col = class_color(target, c); cs += [[i / ncat, col], [(i + 1) / ncat, col]]
+    fig = go.Figure(go.Heatmap(z=[zr(gt), zr(pred)], x=times, y=['정답', '예측'], zmin=0, zmax=ncat,
+                               colorscale=cs, showscale=False, ygap=5, hoverinfo='skip'))
+    mmx = [float(times[i]) for i in range(min(pos, n)) if pred[i] != gt[i]]
+    if mmx:
+        fig.add_trace(go.Scatter(x=mmx, y=['예측'] * len(mmx), mode='markers',
+                                 marker=dict(symbol='x', color='#111', size=9), hoverinfo='skip', showlegend=False))
+    if 0 < pos < n:
+        fig.add_vline(x=float(times[pos - 1]), line_color='red', line_dash='dot')
+    fig.update_layout(height=170, margin=dict(l=6, r=6, t=8, b=6), xaxis_title="시간(s)")
+    return fig
+
+
 @st.cache_data
 def load_sample(path):
     return [json.loads(l) for l in open(path, encoding='utf-8') if l.strip()]
@@ -479,56 +572,34 @@ def read_ndjson(f):
 
 with st.sidebar:
     st.markdown("#### :material/database: 데이터")
-    up = st.file_uploader("학습·기준 데이터 (NDJSON, 선택)", type=['ndjson', 'jsonl', 'json', 'txt'])
+    up = st.file_uploader("데이터 (NDJSON, 선택)", type=['ndjson', 'jsonl', 'json', 'txt'])
     if up is not None:
         data = read_ndjson(up)
         st.caption(f"업로드: **{up.name}** · {len(data)}줄")
     else:
         data = load_sample(DATA_PATH)
         st.caption("기본: sample_data.ndjson")
-
     TRIM_SEC = 1.0 if st.toggle("마지막 1초 제거 (전처리)", value=True,
                                 help="긁기 종료 구간의 잡음/여운을 제거. 각 신호 끝에서 (1초×샘플링레이트) 샘플을 잘라냅니다.") else 0.0
-    up_test = st.file_uploader("평가용 시계열 (정답 라벨 포함, 선택)", type=['ndjson', 'jsonl', 'json', 'txt'], key="testup")
-    test_data = read_ndjson(up_test) if up_test is not None else None
-    if test_data is not None:
-        st.caption(f"평가용: **{up_test.name}** · {len(test_data)}줄 → '실시간 분류' 탭에서 판정")
-
     full = build_frame(data, TRIM_SEC)
 
     feats = [k for k in FEATS_ALL if full[k].notna().any() and full[k].std(skipna=True) > 0]
     FEATS = {k: FEATS_ALL[k] for k in feats}
-    # 기본 추천 = 강도와 상관(|Spearman rho|)이 가장 큰 특징
     rho0 = {k: abs(spearmanr(full[k], full['intensity'].map(INT3))[0] or 0) for k in feats}
     best = max(feats, key=lambda k: rho0[k])
 
-    st.markdown("#### :material/tune: 분류 · 검증")
+    st.markdown("#### :material/tune: 강도 분류 · 검증")
     _default = ['jerk'] if 'jerk' in feats else [best]
     sel = st.multiselect("분류 특징 (여러 개 선택 가능)", feats, default=_default,
                          format_func=lambda k: FEATS[k] + (' ⭐' if k == best else ''))
     sel = sel or _default
     multi = len(sel) > 1
-    feat = sel[0]  # 단일 표시용 대표
+    feat = sel[0]
     if multi:
-        st.caption(f"{len(sel)}개 조합 — 표준화 후 약↔강 중심축에 투영해 위치를 계산합니다 (경계가 다차원).")
+        st.caption(f"{len(sel)}개 조합 — 표준화 후 약↔강 중심축에 투영해 위치를 계산합니다.")
     nsubj = full['subject_id'].nunique()
     mode = st.radio("검증 방식", (['LOOCV', 'LOSO'] if nsubj > 1 else ['LOOCV']), horizontal=True,
-                    help="LOOCV=샘플 1개씩 제외 / LOSO=피험자 1명씩 제외(2명 이상 필요). 학습·평가 미겹침.")
-    lo, hi = st.slider("강도 경계 · 약 | 보통 | 강", 0.0, 1.0, (0.40, 0.60), 0.01,
-                       help="두 손잡이로 약↔보통·보통↔강 경계를 지정. 0.5에 얽매이지 않고 어디든 가능(약 경계 ≤ 강 경계).")
-
-    st.markdown("#### :material/category: 실시간 분류 대상")
-    task = st.radio("무엇을 판정할까요? ('실시간 분류' 탭)", ["강도 측정", "긁기 감지", "파이프라인 (감지→강도)"],
-                    key="rt_task", help="강도=규칙기반 앵커. 감지=RandomForest(SCRATCH/NOT_SCRATCH). 파이프라인=SCRATCH 윈도우만 강도 판정.")
-
-    # 데이터 누수 감지: 학습셋 vs 평가셋 피험자/파일 겹침
-    train_subj = set(str(s) for s in full['subject_id'].unique())
-    if test_data is not None:
-        ev_subj = set(str(d.get('subject_id', '?')) for d in test_data)
-        same_file = (up is not None and up_test.name == up.name)
-        leak = same_file or bool(train_subj & ev_subj)
-    else:
-        ev_subj, same_file, leak = set(), False, None
+                    help="LOOCV=샘플 1개씩 제외 / LOSO=피험자 1명씩 제외(2명 이상). 학습·평가 미겹침.")
 
     st.markdown("#### :material/filter_list: 필터")
     varying = {f: sorted(full[f].unique()) for f in META if full[f].nunique() > 1}
@@ -541,13 +612,26 @@ with st.sidebar:
     else:
         st.caption("값이 여러 개인 축이 아직 없습니다. 데이터가 쌓이면 필터가 늘어납니다.")
 
-if frame.empty or frame['강도'].nunique() < 2:
-    st.warning("분석에 필요한 데이터가 부족합니다(최소 2개 강도). 필터를 넓혀 주세요."); st.stop()
-frame = frame.reset_index(drop=True)
+    if frame.empty or frame['강도'].nunique() < 2:
+        st.warning("분석에 필요한 데이터가 부족합니다(최소 2개 강도). 필터를 넓혀 주세요."); st.stop()
+    frame = frame.reset_index(drop=True)
+
+    st.markdown("#### :material/target: 강도 경계")
+    pos_cv = cv_scores(frame, sel, mode)
+    ytrue_cv = frame['강도'].map(LAB_MAP).values
+    opt_lo, opt_hi, opt_f1 = optimal_boundaries(pos_cv, ytrue_cv)
+    auto_bound = st.toggle("F1 최대 경계 자동 선택", value=True,
+                           help="선택한 특징에서 macro-F1을 최대화하는 경계를 자동 적용. 끄면 수동 슬라이더.")
+    if auto_bound:
+        lo, hi = opt_lo, opt_hi
+        st.caption(f"F1 최적 경계 **[{lo:.2f}, {hi:.2f}]** (macro-F1 {opt_f1:.2f}) 자동 적용")
+    else:
+        lo, hi = st.slider("강도 경계 · 약 | 보통 | 강", 0.0, 1.0, (opt_lo, opt_hi), 0.01,
+                           help="0.5에 얽매이지 않고 어디든 (약 경계 ≤ 강 경계).")
 
 # ── CV 판정 ─────────────────────────────────────────────────────
 res = frame.copy()
-res['위치'] = cv_scores(frame, sel, mode).round(3)
+res['위치'] = np.round(pos_cv, 3)
 res['예측'] = predict(res['위치'].values, lo, hi)
 res['정답'] = res['예측'] == res['강도']
 yt = res['강도'].map(LAB_MAP).values
@@ -581,78 +665,123 @@ with screen_all:
     box.plotly_chart(overview_fig(res, lo, hi), width="stretch")
     box.caption(f"오분류 {int((~res['정답']).sum())}건 · 정분류는 약→강 대각선, 대각선을 벗어난 ✕가 오분류. "
                 "약 레인의 ✕가 오른쪽 끝(강 구간)이면 심각 오류. 개별 샘플은 '개별 상세' 창에서 뜯어봅니다.")
-    t_pat, t_feat, t_opt, t_live = st.tabs(["패턴 요약", "특징 비교", "경계 최적화", "실시간 분류"])
+    t_pat, t_feat, t_opt = st.tabs(["패턴 요약", "특징 비교", "경계 최적화"])
 
 # ═══ 화면 2: 개별 상세 (샘플 하나를 깊게) ═════════════════════════
 with screen_one:
-    st.markdown("**개별 상세** — 샘플 하나를 고르면 시간축을 따라 윈도우별로 강도가 어떻게 판정되는지 흐름으로 봅니다.")
-    only_wrong = st.checkbox(f"오분류만 보기 ({int((~res['정답']).sum())}건)", value=False)
+    st.markdown("**개별 상세** — 샘플 하나를 고르면 시간축을 따라 윈도우별로 분류합니다. **대상(강도/부위/긁기 감지)과 모델**을 고를 수 있어요.")
+    only_wrong = st.checkbox(f"강도 오분류만 보기 ({int((~res['정답']).sum())}건)", value=False)
     pool = (res[~res['정답']] if only_wrong else res).reset_index(drop=True)
     if pool.empty:
         st.success("오분류가 없습니다.", icon=":material/check_circle:")
     else:
-        ri = st.selectbox("샘플 선택", range(len(pool)),
+        cS, cT, cM = st.columns([2, 1, 1])
+        ri = cS.selectbox("샘플 선택", range(len(pool)),
                           format_func=lambda i: f"idx {int(pool.iloc[i]['idx'])} · 실제 {pool.iloc[i]['강도']} "
-                                                f"(전체판정 {pool.iloc[i]['예측']})" + ("" if pool.iloc[i]['정답'] else "  ❌"))
-        r = pool.iloc[ri]; d = data[int(r['idx'])]; L = r['강도']; lc = {'약': 'green', '보통': 'orange', '강': 'red'}[L]
-        m = amag(d, TRIM_SEC); g = gmag(d, TRIM_SEC); fs = est_fs(d); dur = len(m) / fs
-        ok = bool(r['정답'])
+                                                f"(강도판정 {pool.iloc[i]['예측']})" + ("" if pool.iloc[i]['정답'] else "  ❌"))
+        det_target = cT.selectbox("시간별 대상", ['강도', '부위', '긁기 감지'], key="det_target")
+        model_opts = (['규칙기반(앵커)'] if det_target == '강도' else []) + list(MODELS)
+        det_model = cM.selectbox("분류 모델", model_opts, key="det_model")
 
-        # 정직한 모델: 이 샘플(LOSO면 이 피험자)을 제외하고 학습 → out-of-sample 흐름
-        if mode == 'LOSO':
-            train_fr = full[full['subject_id'] != r['subject_id']]
+        r = pool.iloc[ri]; d = data[int(r['idx'])]; sid = int(r['idx']); fs = est_fs(d)
+        m = amag(d, TRIM_SEC); g = gmag(d, TRIM_SEC); dur = len(m) / fs
+        L = r['강도']; lc = {'약': 'green', '보통': 'orange', '강': 'red'}[L]; ok = bool(r['정답'])
+        rule = (det_target == '강도' and det_model == '규칙기반(앵커)')
+        true_cls = TARGET_LABEL[det_target](d)
+
+        posv = None; cvacc = None; honest_note = None
+        if rule:
+            # 정직한 모델: 종합 화면과 같은 (필터된) frame에서 이 샘플(LOSO면 이 피험자)만 제외 → out-of-sample
+            train_fr = frame[frame['subject_id'] != r['subject_id']] if mode == 'LOSO' else frame[frame['idx'] != sid]
+            if train_fr['intensity'].nunique() < 2:
+                train_fr = frame; honest_note = "이 샘플을 빼면 강도 클래스가 부족해 흐름을 in-sample로 계산 (과대평가 가능)."
+            times, posv, pred = sample_strength_series(d, TRIM_SEC, fs, train_model(train_fr, sel, lo, hi))
+            classes = LABELS
         else:
-            train_fr = full[full['idx'] != int(r['idx'])]
-        if train_fr['intensity'].nunique() < 2:
-            train_fr = full
-        smodel = train_model(train_fr, sel, lo, hi)
-        times, posv, pred = sample_strength_series(d, TRIM_SEC, fs, smodel)
-        n = len(times); agree = np.array([p == L for p in pred]); vc = pd.Series(pred).value_counts()
-        final_pred = vc.index[0]; consistency = vc.iloc[0] / n; hit = agree.mean()
+            # 감지는 NOT_SCRATCH가 frame에서 제외되므로 전체 data로, 강도/부위는 필터된 frame으로 학습
+            idxs = tuple(range(len(data))) if det_target == '긁기 감지' else tuple(sorted(int(x) for x in frame['idx']))
+            W = ml_windows(data, idxs, det_target, det_model, int(round(fs_data)), TRIM_SEC, len(data))
+            classes = W['classes']; cvacc = W['cvacc']; maskw = (W['grp'] == sid)
+            if W['model'] is None or not maskw.any() or true_cls is None:
+                times = np.array([]); pred = np.array([])
+            else:
+                times = (W['starts'][maskw] + W['w'] / 2) / W['fs']
+                pred = W['oof'][maskw] if W['oof'] is not None else W['model'].predict(
+                    np.array([det_features(m[s:s + W['w']], (g if g is not None else np.zeros_like(m))[s:s + W['w']], fs)
+                              for s in W['starts'][maskw]]))
+        gt = [true_cls] * len(times)
+        n = len(times)
+        agree = np.array([pred[i] == gt[i] for i in range(n)], dtype=bool)
+        true_disp = class_disp(det_target, true_cls) if true_cls is not None else '—'
 
-        st.markdown(f"### 실제 :{lc}[{L}] · 시간별 강도 판정 흐름")
-        k1, k2, k3, k4 = st.columns(4)
-        fc = {'약': 'green', '보통': 'orange', '강': 'red'}[final_pred]
-        k1.metric("최종 판정 (다수결)", final_pred, help="윈도우 예측의 최빈 클래스")
-        k2.metric("시간 일관성", f"{consistency:.0%}", delta=f"{int(vc.iloc[0])}/{n} 창", delta_color="off",
-                  help="가장 많이 나온 예측이 차지하는 비율 — 판정이 얼마나 안 흔들리나")
-        k3.metric("정답 일치율", f"{hit:.0%}", delta=f"{int(agree.sum())}/{n} 창", delta_color="off",
-                  help="예측==실제 라벨인 윈도우 비율 (홉 겹침으로 창들은 독립 아님)")
-        k4.metric("윈도우", f"{n}개", help="1초 창 · 0.25초 홉")
+        st.markdown(f"### 실제 **{true_disp}** · 시간별 **{det_target}** 판정 ({det_model})")
+        if honest_note:
+            st.warning(honest_note, icon=":material/warning:")
 
-        # 재생 제어 (session_state, det_ 네임스페이스). 기본은 전체 표시.
-        dsig = (int(r['idx']), tuple(sel), round(lo, 2), round(hi, 2), TRIM_SEC, mode)
-        if st.session_state.get('det_sig') != dsig:
-            st.session_state['det_sig'] = dsig; st.session_state['det_pos'] = n; st.session_state['det_playing'] = False
-        pos = min(st.session_state.get('det_pos', n), n)
-        pc = st.columns([1, 1, 1, 1, 3])
-        if pc[0].button("▶ 재생", key="det_play"):
-            st.session_state['det_playing'] = True; st.session_state['det_pos'] = 0 if pos >= n else pos
-        if pc[1].button("⏸ 일시정지", key="det_pause"):
-            st.session_state['det_playing'] = False
-        if pc[2].button("⏭ 한 윈도우", key="det_step"):
-            st.session_state['det_playing'] = False; st.session_state['det_pos'] = min(n, pos + 1)
-        if pc[3].button("⏹ 전체", key="det_stop"):
-            st.session_state['det_playing'] = False; st.session_state['det_pos'] = n
-        dspeed = pc[4].slider("재생 속도", 1, 20, 8, key="det_speed")
-        pos = min(st.session_state.get('det_pos', n), n)
+        if n == 0:
+            st.info(f"'{det_target}' × '{det_model}'로는 이 샘플을 분류할 수 없습니다 "
+                    "(학습 데이터에 클래스가 하나뿐이거나 이 샘플에 라벨 없음). 아래 원신호는 확인할 수 있어요.",
+                    icon=":material/info:")
+            pos = 0
+        else:
+            vc = pd.Series(pred).value_counts()
+            dom_frac = vc.iloc[0] / n; hit = agree.mean()
+            if rule:
+                final_pred = str(predict(np.array([float(np.mean(posv))]), lo, hi)[0])  # 평균 위치(동률 안전·순서형)
+            else:
+                final_pred = str(vc.index[0])  # 다수결
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("종합 판정", class_disp(det_target, final_pred),
+                      help="강도 규칙=평균 위치점수 구간 / ML=윈도우 다수결")
+            k2.metric("시간 일관성", f"{dom_frac:.0%}", delta=f"{int(vc.iloc[0])}/{n} 창", delta_color="off",
+                      help="가장 많이 나온 예측이 차지하는 비율 — 낮으면 시간에 따라 흔들림")
+            k3.metric("정답 일치율", f"{hit:.0%}", delta=f"{int(agree.sum())}/{n} 창", delta_color="off",
+                      help="예측==실제 라벨인 윈도우 비율 (홉 75% 겹침으로 창들은 독립 아님)")
+            if rule:
+                k4.metric("윈도우", f"{n}개", help="1초 창 · 0.25초 홉")
+            else:
+                k4.metric("모델 CV 정확도", f"{cvacc:.0%}" if cvacc is not None else "—",
+                          help="학습셋 동작 단위 GroupKFold 교차검증 정확도 (참고)")
 
-        box = st.container(border=True)
-        box.markdown("**강도 흐름** · 선=위치점수(0=약 기준·1=강 기준), 배경=판정된 강도 구간, ○=정답과 일치·✕=불일치")
-        box.plotly_chart(flow_fig(times, posv, pred, L, lo, hi, pos), width="stretch", key="det_flow")
-        box.markdown("범례: :green[약] · :orange[보통] · :red[강]  ·  재생 위치=빨간 점선  ·  "
-                     f"현재 :{lc}[{L}] 을(를) {consistency:.0%} 구간에서 **{final_pred}** 로 판정")
+            # 재생 제어 (session_state, det_ 네임스페이스). 기본은 전체 표시.
+            dsig = (sid, det_target, det_model, tuple(sel), round(lo, 2), round(hi, 2), TRIM_SEC, mode)
+            if st.session_state.get('det_sig') != dsig:
+                st.session_state['det_sig'] = dsig; st.session_state['det_pos'] = n; st.session_state['det_playing'] = False
+            pos = min(st.session_state.get('det_pos', n), n)
+            pc = st.columns([1, 1, 1, 1, 3])
+            if pc[0].button("▶ 재생", key="det_play"):
+                st.session_state['det_playing'] = True; st.session_state['det_pos'] = 0 if pos >= n else pos
+            if pc[1].button("⏸ 일시정지", key="det_pause"):
+                st.session_state['det_playing'] = False
+            if pc[2].button("⏭ 한 윈도우", key="det_step"):
+                st.session_state['det_playing'] = False; st.session_state['det_pos'] = min(n, pos + 1)
+            if pc[3].button("⏹ 전체", key="det_stop"):
+                st.session_state['det_playing'] = False; st.session_state['det_pos'] = n
+            dspeed = pc[4].slider("재생 속도", 1, 20, 8, key="det_speed")
+            pos = min(st.session_state.get('det_pos', n), n)
 
-        # 재생 커서 위치의 현재 윈도우 드릴다운 (전체보기가 아닐 때)
-        if 0 < pos < n:
-            w = int(fs); s0 = int(round(times[pos - 1] * fs - w / 2)); s0 = max(0, min(len(m) - w, s0))
-            seg = m[s0:s0 + w]; pk = pred[pos - 1]; ag = (pk == L)
-            b = st.container(border=True)
-            b.markdown(f"**현재 윈도우 #{pos}** ({times[pos-1]:.2f}s) · 위치 {posv[pos-1]:.2f} · 예측 "
-                       f":{ {'약':'green','보통':'orange','강':'red'}[pk] }[{pk}] · " + ("✅ 일치" if ag else "❌ 불일치"))
-            wc1, wc2 = b.columns(2)
-            wc1.plotly_chart(wave_fig(seg, color=COLOR[ENG[pk]], height=180, fs=fs), width="stretch", key="det_wwave")
-            wc2.plotly_chart(spec_fig(seg, height=180, fs=fs), width="stretch", key="det_wspec")
+            box = st.container(border=True)
+            if rule:
+                box.markdown("**강도 흐름** · 선=위치점수(0=약 기준·1=강 기준), 배경=판정 강도 구간, ○=정답 일치·✕=불일치")
+                box.plotly_chart(flow_fig(times, posv, pred, L, lo, hi, pos), width="stretch", key="det_flow")
+            else:
+                box.markdown(f"**{det_target} 예측 타임라인** · 위=정답·아래=예측 · ✕=불일치")
+                box.plotly_chart(class_band_fig(times, pred, gt, det_target, classes, pos), width="stretch", key="det_flow")
+            leg = " · ".join(f"<span>{class_disp(det_target, c)}</span>" for c in classes)
+            box.markdown(f"종합 판정 **{class_disp(det_target, final_pred)}** · 정답 일치 {hit:.0%} · 최빈 예측 {dom_frac:.0%} · 클래스: {leg}",
+                         unsafe_allow_html=True)
+
+            # 재생 커서 위치의 현재 윈도우 드릴다운 (전체보기가 아닐 때)
+            if 0 < pos < n:
+                w = int(fs); s0 = int(round(times[pos - 1] * fs - w / 2)); s0 = max(0, min(len(m) - w, s0))
+                seg = m[s0:s0 + w]; pk = pred[pos - 1]; agk = (pk == gt[pos - 1])
+                b = st.container(border=True)
+                extra = f" · 위치 {posv[pos-1]:.2f}" if posv is not None else ""
+                b.markdown(f"**현재 윈도우 #{pos}** ({times[pos-1]:.2f}s){extra} · 예측 **{class_disp(det_target, pk)}** · "
+                           + ("✅ 일치" if agk else "❌ 불일치"))
+                wc1, wc2 = b.columns(2)
+                wc1.plotly_chart(wave_fig(seg, color=class_color(det_target, pk), height=180, fs=fs), width="stretch", key="det_wwave")
+                wc2.plotly_chart(spec_fig(seg, height=180, fs=fs), width="stretch", key="det_wspec")
 
         with st.expander("원신호 (파형 · 스펙트로그램 · PSD · 자이로)", icon=":material/ssid_chart:"):
             trim_note = f" · 마지막 1초 제거됨(-{round(TRIM_SEC*fs)}샘플)" if TRIM_SEC > 0 else ""
@@ -699,8 +828,12 @@ with screen_one:
             rc = rt_ = 0; ct, cv = [], []; rec = []
             for i in range(pos):
                 rt_ += 1; rc += int(agree[i]); ct.append(float(times[i])); cv.append(rc / rt_ * 100)
-                rec.append({'윈도우': i + 1, '시간(s)': round(float(times[i]), 2), '위치점수': round(float(posv[i]), 2),
-                            '예측': pred[i], '정답': L, '결과': '✅' if agree[i] else '❌'})
+                row = {'윈도우': i + 1, '시간(s)': round(float(times[i]), 2),
+                       '예측': class_disp(det_target, pred[i]), '정답': class_disp(det_target, gt[i]),
+                       '결과': '✅' if agree[i] else '❌'}
+                if posv is not None:
+                    row['위치점수'] = round(float(posv[i]), 2)
+                rec.append(row)
             a1, a2 = st.columns([3, 2])
             with a1:
                 b = st.container(border=True); b.markdown("**누적 일치율** (예측==실제, 재생 위치까지)")
@@ -716,15 +849,15 @@ with screen_one:
                 b.dataframe(pd.DataFrame(rec).iloc[::-1] if rec else pd.DataFrame(),
                             width="stretch", hide_index=True, height=240)
 
-        if not ok:
-            with st.expander(f"오분류 진단 — 같은 실제 '{L}' 정분류와 나란히 비교", icon=":material/compare_arrows:", expanded=True):
+        if not ok and det_target == '강도':
+            with st.expander(f"강도 오분류 진단 — 같은 실제 '{L}' 정분류와 나란히 비교", icon=":material/compare_arrows:", expanded=True):
                 same_ok = res[(res['강도'] == L) & (res['정답'])].sort_values('위치').reset_index(drop=True)
                 if same_ok.empty:
                     st.warning(f"같은 실제 라벨('{L}')의 정분류 샘플이 없어 비교 대상이 없습니다.")
                 else:
                     ci = st.selectbox("비교할 정분류 샘플(같은 실제 라벨)", range(len(same_ok)), index=len(same_ok) // 2,
                                       format_func=lambda j: f"idx {int(same_ok.loc[j,'idx'])} · 위치 {same_ok.loc[j,'위치']:.2f}",
-                                      key="det_cmp")
+                                      key=f"det_cmp_{int(r['idx'])}")
                     wcol = COLOR[ENG[L]]; mw = m; fw = fs
                     cr = same_ok.loc[ci]; dc = data[int(cr['idx'])]; mc = amag(dc, TRIM_SEC); fcz = est_fs(dc)
                     _, _, Zw = spectro(mw, fw); _, _, Zc = spectro(mc, fcz)
@@ -754,189 +887,6 @@ with screen_one:
             st.session_state['det_pos'] = min(n, pos + max(1, dspeed)); time.sleep(0.05); st.rerun()
         elif pos >= n and st.session_state.get('det_playing'):
             st.session_state['det_playing'] = False
-
-# ── 탭: 실시간 분류 (윈도우 단위 가상 연속 시계열 재생) ──────────
-CAT_COLOR = {'약': COLOR['weak'], '보통': COLOR['normal'], '강': COLOR['strong'],
-             'SCRATCH': '#10B981', 'NOT_SCRATCH': '#94A3B8', '무동작': '#e5e7eb', '-': '#e5e7eb'}
-with t_live:
-    st.markdown("**실시간 분류 — 윈도우 단위 시계열 재생**")
-    st.warning("동작 단위 샘플을 이어붙인 **가상 연속 시계열**입니다. 실제 연속 녹화가 아닙니다.", icon=":material/info:")
-
-    eval_data = test_data if test_data is not None else data
-    detect = task in ("긁기 감지", "파이프라인 (감지→강도)")
-    pipeline = task == "파이프라인 (감지→강도)"
-    labeled = any((d.get('intensity') is not None) or (d.get('label') is not None) for d in eval_data)
-
-    # 데이터 누수/피험자 겹침 경고 (정직한 표기)
-    if test_data is None:
-        st.caption("평가용 데이터 미업로드 → 현재(학습) 데이터로 재생하며 지표는 참고용입니다. "
-                   "정직한 평가를 위해 사이드바에 다른 피험자 데이터를 올리세요.")
-    elif leak:
-        why = "같은 파일" if same_file else f"피험자 겹침({', '.join(sorted(train_subj & ev_subj))})"
-        st.warning(f"⚠️ 학습 데이터와 평가 데이터가 {why}입니다. 표시되는 정확도는 **과대평가**입니다.", icon=":material/warning:")
-    else:
-        st.success(f"✅ 학습에 쓰이지 않은 피험자({', '.join(sorted(ev_subj))})로 평가 중입니다. (LOSO)", icon=":material/verified_user:")
-
-    fsd = int(round(fs_data))
-    sig = (task, tuple(sel), round(lo, 2), round(hi, 2), TRIM_SEC, len(eval_data),
-           'test' if test_data is not None else 'train')
-
-    if st.session_state.get('rt_sig') != sig:
-        with st.spinner("가상 연속 시계열 구성 + 윈도우 판정 준비 중…"):
-            ma, mg, s_lab, s_int = build_stream(eval_data, fsd, TRIM_SEC)
-            wins = stream_windows(ma, mg, s_lab, s_int, fsd)
-            w = int(fsd); times = np.array([x['tc'] for x in wins])
-            # 강도 모델(학습셋 앵커 고정) + 윈도우 특징
-            smodel = train_model(full, sel, lo, hi)
-            t0 = time.perf_counter()  # 특징 추출 + 판정 전체를 재어 윈도우당 지연 산출
-            sfeat = [win_strength_feats(ma[x['start']:x['start'] + w], mg[x['start']:x['start'] + w], fsd) for x in wins]
-            _, spred = apply_model(smodel, pd.DataFrame(sfeat))
-            str_ms = (time.perf_counter() - t0) / max(1, len(wins)) * 1000
-            # 감지 모델(RandomForest)
-            rf = cvacc = ncv = None; det_ms = 0.0; det_classes = []
-            dpred = None
-            if detect:
-                rf, cvacc, ncv, det_classes, ntr = train_detector(data, fsd, TRIM_SEC, (len(data), TRIM_SEC))
-                if hasattr(rf, 'classes_'):
-                    t1 = time.perf_counter()
-                    Xd = np.array([det_features(ma[x['start']:x['start'] + w], mg[x['start']:x['start'] + w], fsd) for x in wins])
-                    dpred = rf.predict(Xd); det_ms = (time.perf_counter() - t1) / max(1, len(wins)) * 1000
-                else:
-                    dpred = np.array(['SCRATCH'] * len(wins))  # 학습셋에 NOT_SCRATCH 없음 → 감지 불가
-            # 창별 정답/예측/평가가능 여부
-            gt, pred, ev = [], [], []
-            for i, x in enumerate(wins):
-                gl = 'NOT_SCRATCH' if x['gt_label'] in ('GAP', 'NOT_SCRATCH') else 'SCRATCH'
-                gi = KR.get(x['gt_int']) if x['gt_int'] is not None else None
-                if pipeline:
-                    is_s = (dpred[i] == 'SCRATCH')
-                    p = spred[i] if is_s else '-'
-                    g = gi if gl == 'SCRATCH' else '무동작'
-                    can = (gl == 'SCRATCH'); ok = can and (p == g)
-                elif detect:
-                    p, g = dpred[i], gl; can = labeled; ok = (p == g)
-                else:  # 강도 측정
-                    p = spred[i]; g = gi if gi is not None else '무동작'
-                    can = (gi is not None); ok = can and (p == g)
-                pred.append(p); gt.append(g); ev.append((can, ok))
-            lat = det_ms if detect else str_ms
-            st.session_state['rt_sig'] = sig
-            st.session_state['rt'] = dict(ma=ma, mg=mg, fs=fsd, times=times, gt=gt, pred=pred, ev=ev,
-                                          lat=lat, cvacc=cvacc, ncv=ncv, det_classes=det_classes,
-                                          total=len(wins), w=w, detect=detect)
-            st.session_state['rt_pos'] = 0; st.session_state['rt_playing'] = False
-
-    R = st.session_state['rt']; total = R['total']
-    st.session_state.setdefault('rt_pos', 0); st.session_state.setdefault('rt_playing', False)
-    pos = min(st.session_state['rt_pos'], total)
-
-    # 재생 제어
-    b1, b2, b3, b4, b5 = st.columns([1, 1, 1, 1, 3])
-    if b1.button("▶ 재생", key="rt_play"):
-        st.session_state['rt_playing'] = True
-        if pos >= total:
-            st.session_state['rt_pos'] = 0
-    if b2.button("⏸ 일시정지", key="rt_pause"):
-        st.session_state['rt_playing'] = False
-    if b3.button("⏭ 한 윈도우", key="rt_stepbtn"):
-        st.session_state['rt_playing'] = False; st.session_state['rt_pos'] = min(total, pos + 1)
-    if b4.button("⏹ 정지", key="rt_stopbtn"):
-        st.session_state['rt_playing'] = False; st.session_state['rt_pos'] = 0
-    speed = b5.slider("재생 속도", 1, 20, 8, key="rt_speed")
-    pos = min(st.session_state['rt_pos'], total)
-
-    # 지표
-    evd = R['ev'][:pos]
-    nden = sum(1 for c, _ in evd if c); nok = sum(1 for c, o in evd if c and o)
-    m1, m2, m3, m4 = st.columns(4)
-    if R['detect'] and not labeled:
-        m1.metric("누적 정확도", "라벨 없음")
-    elif nden:
-        m1.metric("누적 정확도", f"{nok/nden:.0%}", delta=f"{nok}/{nden}", delta_color="off")
-    else:
-        m1.metric("누적 정확도", "—")
-    m2.metric("처리 윈도우", f"{pos}/{total}")
-    m3.metric("윈도우당 지연", f"{R['lat']:.1f} ms", help="1초 윈도우/0.25초 홉 → 250ms 예산 안이면 100Hz 실시간 가능")
-    if R['detect'] and R['cvacc'] is not None:
-        m4.metric("감지 CV 정확도", f"{R['cvacc']:.0%}", delta=f"n={R['ncv']}", delta_color="off")
-    else:
-        m4.metric("예산", "250 ms")
-
-    if R['detect'] and not R['det_classes'][1:]:
-        st.info("학습 데이터에 NOT_SCRATCH가 없어 감지 모델을 학습할 수 없습니다 — 모든 윈도우를 SCRATCH로 간주합니다.", icon=":material/info:")
-
-    # 현재 윈도우 판정
-    if pos > 0:
-        can, ok = R['ev'][pos - 1]; gv, pv = R['gt'][pos - 1], R['pred'][pos - 1]
-        res_txt = (":green[✅ 일치]" if ok else ":red[❌ 불일치]") if can else ":gray[정답 없음]"
-        st.markdown(f"**윈도우 #{pos}** ({R['times'][pos-1]:.2f}s) &nbsp; 예측 **{pv}** · 정답 **{gv}** &nbsp; {res_txt}")
-
-    # 흘러가는 파형 + 스펙트로그램 (현재 위치 표시)
-    cur_t = R['times'][pos - 1] if pos > 0 else 0.0
-    fs = R['fs']; i1 = int(max(0, cur_t - 10) * fs); i2 = int(min(len(R['ma']), (cur_t + 1) * fs))
-    seg = R['ma'][i1:i2]; tx = np.arange(i1, i2) / fs
-    g1, g2 = st.columns(2)
-    with g1:
-        box = st.container(border=True); box.markdown("**흘러가는 파형** (최근 10초)")
-        wf = go.Figure(go.Scatter(x=tx, y=seg, mode='lines', line=dict(color=ACCENT, width=1)))
-        if pos > 0:
-            wf.add_vline(x=cur_t, line_color='red', line_dash='dot')
-        wf.update_layout(height=220, margin=dict(l=6, r=6, t=6, b=6), xaxis_title="시간(s)", yaxis_title="가속도 크기")
-        box.plotly_chart(wf, width="stretch", key="rt_wave")
-    with g2:
-        box = st.container(border=True); box.markdown("**스펙트로그램** (최근 10초)")
-        box.plotly_chart(spec_fig(seg, height=220, fs=fs), width="stretch", key="rt_spec")
-
-    # 타임라인 비교 띠 (정답 vs 예측)
-    box = st.container(border=True)
-    box.markdown("**타임라인 비교** · 위=정답, 아래=예측 · 색이 다른 구간이 오분류 (왼쪽부터 채워짐)")
-    cats = [c for c in ['약', '보통', '강', 'SCRATCH', 'NOT_SCRATCH', '무동작', '-']
-            if c in set(R['gt']) | set(R['pred'])]
-    cidx = {c: i for i, c in enumerate(cats)}; n = max(1, len(cats))
-    zrow = lambda vals: [(cidx[v] + 0.5) if (j < pos and v in cidx) else None for j, v in enumerate(vals)]
-    cs = []
-    for i, c in enumerate(cats):
-        cs += [[i / n, CAT_COLOR.get(c, '#bbb')], [(i + 1) / n, CAT_COLOR.get(c, '#bbb')]]
-    band = go.Figure(go.Heatmap(z=[zrow(R['gt']), zrow(R['pred'])], x=R['times'], y=['정답', '예측'],
-                                zmin=0, zmax=n, colorscale=cs, showscale=False, ygap=4, hoverinfo='skip'))
-    band.update_layout(height=150, margin=dict(l=6, r=6, t=6, b=6), xaxis_title="시간(s)")
-    box.plotly_chart(band, width="stretch", key="rt_band")
-    _lc = {'약': 'green', 'SCRATCH': 'green', '강': 'red', '보통': 'orange'}
-    box.markdown("범례: " + " · ".join(f":{_lc.get(c,'gray')}[{c}]" for c in cats))
-
-    # 시간별 누적 정확도 곡선 + 윈도우별 판정 로그
-    rec = []; rc = rt_ = 0; ct, cv = [], []
-    for i in range(pos):
-        can, ok = R['ev'][i]
-        if can:
-            rt_ += 1; rc += int(ok); ct.append(float(R['times'][i])); cv.append(rc / rt_ * 100)
-        rec.append({'윈도우': i + 1, '시간(s)': round(float(R['times'][i]), 2),
-                    '예측': R['pred'][i], '정답': R['gt'][i],
-                    '결과': ('—' if not can else ('✅' if ok else '❌'))})
-    a1, a2 = st.columns([3, 2])
-    with a1:
-        box = st.container(border=True); box.markdown("**시간별 누적 정확도** (평가 가능한 윈도우 기준)")
-        if ct:
-            af = go.Figure(go.Scatter(x=ct, y=cv, mode='lines', line=dict(color=ACCENT, width=2)))
-            af.update_layout(height=240, margin=dict(l=6, r=6, t=6, b=6),
-                             xaxis_title="시간(s)", yaxis_title="누적 정확도(%)", yaxis_range=[0, 100])
-            box.plotly_chart(af, width="stretch", key="rt_acc")
-        else:
-            box.caption("아직 평가 가능한 윈도우가 없습니다. ▶ 재생하거나 ⏭로 진행하세요.")
-    with a2:
-        box = st.container(border=True); box.markdown("**윈도우별 판정** (최근순)")
-        if rec:
-            box.dataframe(pd.DataFrame(rec).iloc[::-1], width="stretch", hide_index=True, height=240)
-        else:
-            box.caption("아직 처리한 윈도우가 없습니다.")
-
-    # 자동 재생: playing이면 한 스텝 전진 후 rerun (일시정지/정지로 멈춤)
-    if st.session_state['rt_playing'] and pos < total:
-        st.session_state['rt_pos'] = min(total, pos + max(1, speed))
-        time.sleep(0.05); st.rerun()
-    elif pos >= total and st.session_state['rt_playing']:
-        st.session_state['rt_playing'] = False
-        st.toast("재생 완료", icon=":material/check_circle:")
 
 # ── 탭 2: 패턴 요약 ─────────────────────────────────────────────
 with t_pat:
